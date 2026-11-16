@@ -661,15 +661,25 @@ applyTables() {
   local gateway="${3:-}"
   local silent="${4:-N}"
   local table_error
-  local rule_tag="PROXMOX_NAT"
+  # Reserved chains identify our rules without requiring xt_comment.
+  local table chain
+  while read -r table chain; do
+    if ! runTableRule "$silent" table_error iptables -t "$table" -N "$chain"; then
+      tableError "$silent" "$table_error"
+      return 1
+    fi
+  done <<'EOF'
+nat PVE_DOCKER_POST
+nat PVE_DOCKER_PRE
+filter PVE_DOCKER_FWD
+EOF
 
   # NAT traffic from the VM subnet leaving through any external interface.
   if ! runTableRule "$silent" table_error \
-    iptables -t nat -A POSTROUTING \
+    iptables -t nat -A PVE_DOCKER_POST \
     ! -o "$BRIDGE" \
     -s "$subnet" \
     ! -d "$subnet" \
-    -m comment --comment "$rule_tag" \
     -j MASQUERADE; then
     tableError "$silent" "$table_error"
     return 1
@@ -679,11 +689,10 @@ applyTables() {
   if [ -n "$upstream" ] && [ -n "$gateway" ]; then
 
     if ! runTableRule "$silent" table_error \
-      iptables -t nat -A PREROUTING \
+      iptables -t nat -A PVE_DOCKER_PRE \
       -i "$BRIDGE" \
       -s "$subnet" \
       -d "$upstream" \
-      -m comment --comment "$rule_tag" \
       -j DNAT --to-destination "$gateway"; then
       tableError "$silent" "$table_error"
       return 1
@@ -693,11 +702,10 @@ applyTables() {
 
   # Allow traffic from the VM bridge to any external interface.
   if ! runTableRule "$silent" table_error \
-    iptables -A FORWARD \
+    iptables -t filter -A PVE_DOCKER_FWD \
     -i "$BRIDGE" \
     ! -o "$BRIDGE" \
     -s "$subnet" \
-    -m comment --comment "$rule_tag" \
     -j ACCEPT; then
     tableError "$silent" "$table_error"
     return 1
@@ -705,20 +713,33 @@ applyTables() {
 
   # Allow traffic from any external interface to the VM subnet.
   if ! runTableRule "$silent" table_error \
-    iptables -A FORWARD \
+    iptables -t filter -A PVE_DOCKER_FWD \
     ! -i "$BRIDGE" \
     -o "$BRIDGE" \
     -d "$subnet" \
-    -m comment --comment "$rule_tag" \
     -j ACCEPT; then
     tableError "$silent" "$table_error"
     return 1
   fi
 
+  # Attach only after every rule has been populated.
+  local parent
+  while read -r table parent chain; do
+    if ! runTableRule "$silent" table_error \
+      iptables -t "$table" -A "$parent" -j "$chain"; then
+      tableError "$silent" "$table_error"
+      return 1
+    fi
+  done <<'EOF'
+nat POSTROUTING PVE_DOCKER_POST
+nat PREROUTING PVE_DOCKER_PRE
+filter FORWARD PVE_DOCKER_FWD
+EOF
+
   return 0
 }
 
-clearTables() {
+clearTaggedTables() {
 
   local table=""
   local line rules remaining
@@ -795,6 +816,64 @@ clearTables() {
   return 0
 }
 
+clearTables() {
+
+  local rc rules table parent chain message
+  local failed=0
+
+  # Retain migration cleanup and code 2 for an inaccessible backend.
+  if clearTaggedTables; then
+    :
+  else
+    rc=$?
+    return "$rc"
+  fi
+
+  while read -r table parent chain; do
+    if ! rules=$(iptables -t "$table" -S 2>&1); then
+      showTableCleanupError "iptables -t $table -S" "$rules"
+      failed=1
+      continue
+    fi
+
+    # Missing chains are normal after cleanup or interrupted setup.
+    if ! grep -Fxq -- "-N $chain" <<< "$rules"; then
+      continue
+    fi
+
+    # Remove duplicate jumps as well as the normal single jump.
+    while grep -Fxq -- "-A $parent -j $chain" <<< "$rules"; do
+      if ! message=$(iptables -t "$table" -D "$parent" -j "$chain" 2>&1); then
+        showTableCleanupError "iptables -t $table -D $parent -j $chain" "$message"
+        failed=1
+        break
+      fi
+      if ! rules=$(iptables -t "$table" -S 2>&1); then
+        showTableCleanupError "iptables -t $table -S" "$rules"
+        failed=1
+        break
+      fi
+    done
+
+    # Never flush built-in chains or unrelated rules.
+    if ! message=$(iptables -t "$table" -F "$chain" 2>&1); then
+      showTableCleanupError "iptables -t $table -F $chain" "$message"
+      failed=1
+      continue
+    fi
+    if ! message=$(iptables -t "$table" -X "$chain" 2>&1); then
+      showTableCleanupError "iptables -t $table -X $chain" "$message"
+      failed=1
+    fi
+  done <<'EOF'
+nat POSTROUTING PVE_DOCKER_POST
+nat PREROUTING PVE_DOCKER_PRE
+filter FORWARD PVE_DOCKER_FWD
+EOF
+
+  return "$failed"
+}
+
 hasTaggedRules() {
 
   local save="$1"
@@ -807,7 +886,8 @@ hasTaggedRules() {
     return 2
   fi
 
-  if grep -Eq -- "$own_rule" <<< "$rules"; then
+  if grep -Eq -- "$own_rule" <<< "$rules" ||
+     grep -Eq -- '^:PVE_DOCKER_(POST|PRE|FWD)[[:space:]]' <<< "$rules"; then
     return 0
   fi
 
